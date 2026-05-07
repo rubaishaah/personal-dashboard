@@ -8,7 +8,7 @@ import {
   LayoutDashboard, Factory, FileText, History, Download,
   AlertTriangle, CheckCircle2, X, Droplet, Zap, Save, Upload,
   TrendingUp, TrendingDown, Database, Building2, Flame,
-  Beaker, Package, Truck, FileDown, Boxes, Edit3
+  Beaker, Package, Truck, FileDown, Boxes, Edit3, Loader2, FileUp 
 } from 'lucide-react';
 
 // ============================================================================
@@ -987,13 +987,19 @@ const DispatchPage = ({ records, period, setPeriod }) => {
 // ============================================================================
 // MANUAL ENTRY PAGE — replaces upload
 // ============================================================================
+
 const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemoData }) => {
   const today = new Date().toISOString().slice(0, 10);
+  const [mode, setMode] = useState('upload');  // 'upload' or 'manual'
   const [plant, setPlant] = useState('RYK');
   const [reportDate, setReportDate] = useState(today);
   const [activeSection, setActiveSection] = useState('production');
   const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [extracted, setExtracted] = useState(null); // preview after AI extraction
+  const fileInputRef = useRef(null);
   const importRef = useRef(null);
+  const [dragActive, setDragActive] = useState(false);
   const [form, setForm] = useState(() => createEmptyRecord('RYK', today).data);
 
   const recent = [...records].sort((a, b) => b.uploadDate.localeCompare(a.uploadDate)).slice(0, 5);
@@ -1021,6 +1027,170 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
     return v === 0 ? '' : v;
   };
 
+  // -------------------- AI UPLOAD HANDLER --------------------
+  const handleFiles = async (files) => {
+    if (!files || files.length === 0) return;
+
+    // Filter to PDFs only
+    const pdfs = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+    if (pdfs.length === 0) {
+      setMsg({ type: 'warning', text: 'Only PDF files supported for AI extraction' });
+      return;
+    }
+
+    setBusy(true);
+    setMsg(null);
+    setExtracted(null);
+
+    try {
+      // Read all PDFs as base64
+      const fileData = await Promise.all(
+        pdfs.map(async (f) => {
+          const buffer = await f.arrayBuffer();
+          const base64 = btoa(
+            new Uint8Array(buffer).reduce((data, byte) => data + String.fromCharCode(byte), '')
+          );
+          return { name: f.name, data: base64 };
+        })
+      );
+
+      // Detect plant from filename
+      const detectedPlant = pdfs[0].name.match(/SKR|Sukk/i) ? 'SKR' :
+                            pdfs[0].name.match(/RYK|Rahim/i) ? 'RYK' : plant;
+
+      const response = await fetch('/api/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files: fileData, plant: detectedPlant }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error + (data.detail ? ': ' + data.detail : ''));
+      }
+
+      // Map extracted JSON onto a fresh form
+      const newForm = createEmptyRecord(detectedPlant, data.reportDate || today).data;
+
+      // Production
+      const p = data.production || {};
+      const prodMap = {
+        cr_chemical_oil: 'cr_chemical_oil',
+        cr_physical_ghee: 'cr_physical_ghee',
+        cr_physical_oil: 'cr_physical_oil',
+        br_hydrogenation: 'br_hydrogenation',
+        br_blending: 'br_blending',
+        br_final_deo_ghee: 'br_final_deo_ghee',
+        br_final_deo_oil: 'br_final_deo_oil',
+      };
+      Object.entries(prodMap).forEach(([key]) => {
+        if (newForm.production[key]) {
+          newForm.production[key].actual = p[`${key}_actual`] || 0;
+          newForm.production[key].mtd = p[`${key}_mtd`] || 0;
+          newForm.production[key].downtime = p[`${key}_downtime`] || 0;
+          newForm.production[key].remarks = p[`${key}_remarks`] || '';
+        }
+      });
+
+      // Filling
+      const f = data.filling || {};
+      Object.assign(newForm.filling, {
+        ryk_oil: f.ryk_oil || 0, ryk_ghee: f.ryk_ghee || 0,
+        ryk_total: f.ryk_total || 0, ryk_mtd: f.ryk_mtd || 0,
+        skr_oil: f.skr_oil || 0, skr_ghee: f.skr_ghee || 0,
+        skr_total: f.skr_total || 0, skr_mtd: f.skr_mtd || 0,
+        brands: {
+          shahbaz_ghee: f.shahbaz_ghee || 0, shahbaz_oil: f.shahbaz_oil || 0,
+          gharana_ghee: f.gharana_ghee || 0, gharana_oil: f.gharana_oil || 0,
+          rite_ghee: f.rite_ghee || 0, rite_oil: f.rite_oil || 0,
+        },
+      });
+
+      // Soap
+      const s = data.soap || {};
+      Object.assign(newForm.soap, {
+        total_actual: s.total_actual_mt || 0,
+        total_mtd: s.total_mtd_mt || 0,
+        forecast: s.forecast_mtd || 0,
+        compliance: s.compliance_pct || 0,
+      });
+
+      // Mustard
+      const m = data.mustard || {};
+      Object.assign(newForm.mustard, {
+        total_kg: m.total_kg || 0,
+        ml_125: m.ml_125 || 0, ml_250: m.ml_250 || 0,
+        ml_500: m.ml_500 || 0, ml_1000: m.ml_1000 || 0,
+        mtd_kg: m.mtd_kg || 0,
+        dispatch_kg: m.dispatch_kg || 0,
+      });
+
+      // Utilities
+      const u = data.utilities || {};
+      newForm.utilities.electricity = {
+        wapda_peak: u.wapda_peak_kwh || 0,
+        wapda_offpeak: u.wapda_offpeak_kwh || 0,
+        solar: u.solar_kwh || 0,
+        generator: u.generator_kwh || 0,
+        total: u.total_electricity_kwh || 0,
+        mtd: 0,
+      };
+      newForm.utilities.naturalGas = {
+        boiler: u.boiler_gas_ft3 || 0,
+        cr: u.cr_gas_ft3 || 0,
+        hydrogen: u.hydrogen_gas_ft3 || 0,
+        remaining: u.remaining_factory_gas_ft3 || 0,
+        total: u.total_gas_ft3 || 0,
+        mtd: 0,
+      };
+      newForm.utilities.steam = {
+        br: u.br_steam_mt || 0, cr: u.cr_steam_mt || 0,
+        soap: u.soap_steam_mt || 0, gasPlant: u.gas_plant_steam_mt || 0,
+        total: u.total_steam_mt || 0, mtd: 0,
+      };
+      newForm.utilities.water.total = u.ro_water_mt || 0;
+      newForm.utilities.diesel.total = u.diesel_total_l || 0;
+      newForm.utilities.hydrogen_lb = u.hydrogen_lb || 0;
+      newForm.utilities.furnaceOil = u.furnace_oil_l || 0;
+
+      // Stock
+      const st = data.stock || {};
+      Object.assign(newForm.stock, {
+        fg_ghee: st.fg_ghee_mt || 0, fg_oil: st.fg_oil_mt || 0,
+        packable_ghee: st.packable_ghee_mt || 0, packable_oil: st.packable_oil_mt || 0,
+        hard_blended_ghee: st.hard_blended_ghee_mt || 0, hard_ghee: st.hard_ghee_mt || 0,
+        mustard_packable: st.mustard_packable_mt || 0, ost_total: st.ost_total_mt || 0,
+      });
+      newForm.stock.ost_breakdown = {
+        olein: st.ost_olein || 0, rbd: st.ost_rbd || 0,
+        canola: st.ost_canola || 0, soybean: st.ost_soybean || 0,
+        cottonseed: st.ost_cottonseed || 0,
+      };
+
+      // Dispatch
+      const d = data.dispatch || {};
+      Object.assign(newForm.dispatch, {
+        total_mt: d.total_mt || 0,
+        vehicles: d.vehicles || 0,
+        ghee_consumer: d.ghee_consumer_mt || 0,
+        oil_consumer: d.oil_consumer_mt || 0,
+        rso: d.rso_mt || 0,
+        soap: d.soap_mt || 0,
+      });
+
+      setForm(newForm);
+      setPlant(detectedPlant);
+      if (data.reportDate) setReportDate(data.reportDate);
+      setExtracted({ fileCount: pdfs.length, plant: detectedPlant, date: data.reportDate });
+      setMode('manual');  // switch to review/edit
+      setMsg({ type: 'success', text: `Extracted from ${pdfs.length} PDF(s). Review the values below and click Save.` });
+    } catch (err) {
+      console.error(err);
+      setMsg({ type: 'error', text: `Extraction failed: ${err.message}. You can still enter manually.` });
+    }
+    setBusy(false);
+  };
+
   const handleSave = () => {
     const finalData = JSON.parse(JSON.stringify(form));
     finalData.filling.total_oil = (finalData.filling.ryk_oil || 0) + (finalData.filling.skr_oil || 0);
@@ -1030,23 +1200,25 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
     finalData.filling.grand_total = finalData.filling.total_oil + finalData.filling.total_ghee;
 
     const e = finalData.utilities.electricity;
-    e.total = (e.wapda_peak || 0) + (e.wapda_offpeak || 0) + (e.solar || 0) + (e.generator || 0);
+    if (!e.total) e.total = (e.wapda_peak || 0) + (e.wapda_offpeak || 0) + (e.solar || 0) + (e.generator || 0);
     const g = finalData.utilities.naturalGas;
-    g.total = (g.boiler || 0) + (g.cr || 0) + (g.hydrogen || 0) + (g.remaining || 0);
+    if (!g.total) g.total = (g.boiler || 0) + (g.cr || 0) + (g.hydrogen || 0) + (g.remaining || 0);
     const s = finalData.utilities.steam;
-    s.total = (s.cr || 0) + (s.br || 0) + (s.soap || 0) + (s.gasPlant || 0);
+    if (!s.total) s.total = (s.cr || 0) + (s.br || 0) + (s.soap || 0) + (s.gasPlant || 0);
     finalData.mustard.total_kg = (finalData.mustard.ml_125 || 0) + (finalData.mustard.ml_250 || 0) +
       (finalData.mustard.ml_500 || 0) + (finalData.mustard.ml_1000 || 0);
 
     const newRec = {
       id: `${plant}-${reportDate}-${Date.now()}`,
       uploadDate: today, reportDate, plant,
-      fileName: `Manual entry — ${plant} ${reportDate}`,
-      fileType: 'manual', status: 'processed', data: finalData,
+      fileName: extracted ? `AI extracted (${extracted.fileCount} PDFs) — ${plant} ${reportDate}` : `Manual entry — ${plant} ${reportDate}`,
+      fileType: extracted ? 'ai-extracted' : 'manual',
+      status: 'processed', data: finalData,
     };
     addRecord(newRec);
     setMsg({ type: 'success', text: `Saved ${plant} report for ${reportDate}` });
     setForm(createEmptyRecord(plant, reportDate).data);
+    setExtracted(null);
     setActiveSection('production');
     setTimeout(() => setMsg(null), 4000);
   };
@@ -1054,6 +1226,7 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
   const handleClear = () => {
     if (window.confirm('Clear all entered values?')) {
       setForm(createEmptyRecord(plant, reportDate).data);
+      setExtracted(null);
     }
   };
 
@@ -1069,9 +1242,32 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-      <PageHeader title="Enter Daily Report Data"
-        subtitle="Type in the numbers from your daily PDFs — totals calculate automatically" />
+      <PageHeader title="Add Daily Report"
+        subtitle="Upload PDFs for automatic AI extraction, or enter manually" />
 
+      {/* Mode Toggle */}
+      <div style={{ display: 'flex', gap: 8, padding: 4, background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, alignSelf: 'flex-start' }}>
+        {[
+          { id: 'upload', label: 'AI Upload (PDF)', icon: FileUp },
+          { id: 'manual', label: 'Manual Entry', icon: Edit3 },
+        ].map(t => {
+          const Icon = t.icon;
+          return (
+            <button key={t.id} onClick={() => setMode(t.id)} style={{
+              padding: '9px 18px', borderRadius: 6,
+              background: mode === t.id ? C.primary : 'transparent',
+              color: mode === t.id ? '#fff' : C.textMuted,
+              border: 'none', cursor: 'pointer',
+              fontSize: 13, fontWeight: 500, fontFamily: 'inherit',
+              display: 'flex', alignItems: 'center', gap: 7,
+            }}>
+              <Icon size={14} /> {t.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Plant + Date selectors (always visible) */}
       <Card>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto auto', gap: 14, alignItems: 'end' }}>
           <div>
@@ -1097,231 +1293,282 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
             <label style={LBL_STYLE}>Report Date</label>
             <input type="date" value={reportDate} onChange={e => setReportDate(e.target.value)} style={INPUT_STYLE} />
           </div>
-          <button onClick={handleClear} style={{
-            padding: '10px 16px', background: '#fff', color: C.textMuted,
-            border: `1.5px solid ${C.border}`, borderRadius: 7, cursor: 'pointer',
-            fontSize: 13, fontWeight: 500, fontFamily: 'inherit',
-          }}>Clear</button>
-          <button onClick={handleSave} style={{
-            padding: '10px 22px', background: C.primary, color: '#fff',
-            border: 'none', borderRadius: 7, cursor: 'pointer',
-            fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
-            display: 'flex', alignItems: 'center', gap: 7,
-          }}>
-            <Save size={14} /> Save Report
-          </button>
+          {mode === 'manual' && (
+            <>
+              <button onClick={handleClear} style={{
+                padding: '10px 16px', background: '#fff', color: C.textMuted,
+                border: `1.5px solid ${C.border}`, borderRadius: 7, cursor: 'pointer',
+                fontSize: 13, fontWeight: 500, fontFamily: 'inherit',
+              }}>Clear</button>
+              <button onClick={handleSave} style={{
+                padding: '10px 22px', background: C.primary, color: '#fff',
+                border: 'none', borderRadius: 7, cursor: 'pointer',
+                fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+                display: 'flex', alignItems: 'center', gap: 7,
+              }}>
+                <Save size={14} /> Save Report
+              </button>
+            </>
+          )}
         </div>
 
         {msg && (
           <div style={{
             marginTop: 14, padding: '10px 14px', borderRadius: 7, fontSize: 12.5,
             display: 'flex', alignItems: 'center', gap: 9,
-            background: msg.type === 'success' ? '#EAF4ED' : '#FAF1E0',
-            color: msg.type === 'success' ? '#2D5A3F' : '#7A5510',
-            border: `1px solid ${msg.type === 'success' ? '#C7E0D0' : '#EAD5A8'}`,
+            background: msg.type === 'success' ? '#EAF4ED' : msg.type === 'error' ? '#FBEBEA' : '#FAF1E0',
+            color: msg.type === 'success' ? '#2D5A3F' : msg.type === 'error' ? '#7A2A24' : '#7A5510',
+            border: `1px solid ${msg.type === 'success' ? '#C7E0D0' : msg.type === 'error' ? '#F0C5C2' : '#EAD5A8'}`,
           }}>
-            <CheckCircle2 size={15} /> {msg.text}
+            {msg.type === 'success' ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}
+            {msg.text}
           </div>
         )}
       </Card>
 
-      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-        {sections.map(s => {
-          const Icon = s.icon;
-          const active = activeSection === s.id;
-          return (
-            <button key={s.id} onClick={() => setActiveSection(s.id)} style={{
-              padding: '9px 16px', borderRadius: 7,
-              border: `1px solid ${active ? C.primary : C.border}`,
-              background: active ? C.primary : '#fff',
-              color: active ? '#fff' : C.textMuted,
-              fontSize: 12.5, fontWeight: 500, cursor: 'pointer',
-              display: 'flex', alignItems: 'center', gap: 7, fontFamily: 'inherit',
+      {/* AI UPLOAD MODE */}
+      {mode === 'upload' && (
+        <Card>
+          <div
+            onDragOver={e => { e.preventDefault(); setDragActive(true); }}
+            onDragLeave={() => setDragActive(false)}
+            onDrop={e => { e.preventDefault(); setDragActive(false); handleFiles(Array.from(e.dataTransfer.files)); }}
+            onClick={() => !busy && fileInputRef.current?.click()}
+            style={{
+              border: `2px dashed ${dragActive ? C.primary : C.borderStrong}`,
+              background: dragActive ? C.primaryLight : C.bg,
+              borderRadius: 10, padding: '50px 24px', textAlign: 'center',
+              cursor: busy ? 'wait' : 'pointer',
+            }}
+          >
+            <input ref={fileInputRef} type="file" multiple accept=".pdf"
+              style={{ display: 'none' }} onChange={e => handleFiles(Array.from(e.target.files))} />
+            <div style={{ width: 60, height: 60, background: '#fff', borderRadius: '50%', margin: '0 auto 16px', display: 'flex', alignItems: 'center', justifyContent: 'center', border: `1px solid ${C.border}` }}>
+              {busy ? <Loader2 size={26} color={C.primary} className="spin" /> : <FileUp size={26} color={C.primary} />}
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 500, color: C.text, marginBottom: 5 }}>
+              {busy ? 'Extracting with Gemini AI...' : 'Drop PDFs here or click to browse'}
+            </div>
+            <div style={{ fontSize: 12.5, color: C.textMuted }}>
+              {busy ? 'This takes 10–30 seconds depending on file size' : 'Upload all PDFs from one day at once — Reporting Pack, FG Stock, Soap, Mustard, Spices, etc.'}
+            </div>
+          </div>
+          <div style={{ marginTop: 14, padding: 13, background: C.bg, borderRadius: 7, fontSize: 11.5, color: C.textMuted, lineHeight: 1.6 }}>
+            <strong style={{ color: C.text }}>How it works:</strong> Gemini AI reads the PDFs and extracts all production, filling, soap, mustard, utility, stock, and dispatch metrics into the form. After extraction you'll be able to review and edit any value before saving.
+          </div>
+        </Card>
+      )}
+
+      {/* MANUAL ENTRY / EDIT MODE */}
+      {mode === 'manual' && (
+        <>
+          {extracted && (
+            <div style={{
+              padding: '11px 14px', background: '#EAF4ED', border: '1px solid #C7E0D0',
+              borderRadius: 7, fontSize: 12.5, color: '#2D5A3F',
+              display: 'flex', alignItems: 'center', gap: 9,
             }}>
-              <Icon size={14} />
-              {s.label}
-            </button>
-          );
-        })}
-      </div>
+              <CheckCircle2 size={15} />
+              <strong>AI extracted from {extracted.fileCount} PDF(s).</strong> Review the values below and edit anything that looks wrong, then click Save.
+            </div>
+          )}
 
-      {activeSection === 'production' && (
-        <Card title="Production by Section" subtitle="From page 1 of the Operational Reporting Pack PDF">
-          <table style={TBL_STYLE}>
-            <thead>
-              <tr style={{ borderBottom: `1px solid ${C.borderStrong}`, background: C.bg }}>
-                {['Section', 'Std', 'Actual', 'MTD', 'Downtime', 'Remarks'].map(h => (
-                  <th key={h} style={TH_STYLE}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {[
-                ['cr_chemical_oil', 'CR — Chemical (Oil)'],
-                ['cr_physical_ghee', 'CR — Physical (Ghee)'],
-                ['cr_physical_oil', 'CR — Physical (Oil)'],
-                ['br_hydrogenation', 'BR — Hydrogenation'],
-                ['br_blending', 'BR — Blending'],
-                ['br_final_deo_ghee', 'BR — Final DEO (Ghee)'],
-                ['br_final_deo_oil', 'BR — Final DEO (Oil)'],
-              ].map(([key, label]) => (
-                <tr key={key} style={{ borderBottom: `1px solid ${C.border}` }}>
-                  <td style={TD_STYLE}>{label}</td>
-                  <td style={TD_STYLE_MUTED}>{form.production[key].standard}</td>
-                  <td style={{ padding: '6px' }}>
-                    <input type="number" value={num(`production.${key}.actual`)}
-                      onChange={e => update(`production.${key}.actual`, e.target.value)}
-                      style={CELL_INPUT} placeholder="0" step="0.01" />
-                  </td>
-                  <td style={{ padding: '6px' }}>
-                    <input type="number" value={num(`production.${key}.mtd`)}
-                      onChange={e => update(`production.${key}.mtd`, e.target.value)}
-                      style={CELL_INPUT} placeholder="0" step="0.01" />
-                  </td>
-                  <td style={{ padding: '6px' }}>
-                    <input type="number" value={num(`production.${key}.downtime`)}
-                      onChange={e => update(`production.${key}.downtime`, e.target.value)}
-                      style={CELL_INPUT} placeholder="0" step="0.1" />
-                  </td>
-                  <td style={{ padding: '6px' }}>
-                    <input type="text" value={form.production[key].remarks}
-                      onChange={e => update(`production.${key}.remarks`, e.target.value)}
-                      style={{ ...CELL_INPUT, width: 180, textAlign: 'left' }} placeholder="Plant normal" />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <div style={{ marginTop: 14, padding: 12, background: C.bg, borderRadius: 7, fontSize: 11.5, color: C.textMuted, lineHeight: 1.5 }}>
-            <strong style={{ color: C.text }}>Tip:</strong> Open page 1 of today's Reporting Pack PDF — copy the
-            "Actual Production (MT/D)" column directly into the Actual cells.
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {sections.map(s => {
+              const Icon = s.icon;
+              const active = activeSection === s.id;
+              return (
+                <button key={s.id} onClick={() => setActiveSection(s.id)} style={{
+                  padding: '9px 16px', borderRadius: 7,
+                  border: `1px solid ${active ? C.primary : C.border}`,
+                  background: active ? C.primary : '#fff',
+                  color: active ? '#fff' : C.textMuted,
+                  fontSize: 12.5, fontWeight: 500, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 7, fontFamily: 'inherit',
+                }}>
+                  <Icon size={14} />
+                  {s.label}
+                </button>
+              );
+            })}
           </div>
-        </Card>
-      )}
 
-      {activeSection === 'filling' && (
-        <>
-          <Card title="Filling — by Plant">
-            <div style={GRID_2}>
-              <Field label="RYK Cooking Oil (MT)" value={num('filling.ryk_oil')} onChange={v => update('filling.ryk_oil', v)} />
-              <Field label="RYK Vegetable Ghee (MT)" value={num('filling.ryk_ghee')} onChange={v => update('filling.ryk_ghee', v)} />
-              <Field label="SKR Cooking Oil (MT)" value={num('filling.skr_oil')} onChange={v => update('filling.skr_oil', v)} />
-              <Field label="SKR Vegetable Ghee (MT)" value={num('filling.skr_ghee')} onChange={v => update('filling.skr_ghee', v)} />
-            </div>
-          </Card>
-          <Card title="Filling — by Brand">
-            <div style={GRID_2}>
-              <Field label="Shahbaz Ghee (MT)" value={num('filling.brands.shahbaz_ghee')} onChange={v => update('filling.brands.shahbaz_ghee', v)} />
-              <Field label="Shahbaz Oil (MT)" value={num('filling.brands.shahbaz_oil')} onChange={v => update('filling.brands.shahbaz_oil', v)} />
-              <Field label="Gharana Ghee (MT)" value={num('filling.brands.gharana_ghee')} onChange={v => update('filling.brands.gharana_ghee', v)} />
-              <Field label="Gharana Oil (MT)" value={num('filling.brands.gharana_oil')} onChange={v => update('filling.brands.gharana_oil', v)} />
-              <Field label="Rite Ghee (MT)" value={num('filling.brands.rite_ghee')} onChange={v => update('filling.brands.rite_ghee', v)} />
-              <Field label="Rite Oil (MT)" value={num('filling.brands.rite_oil')} onChange={v => update('filling.brands.rite_oil', v)} />
-            </div>
-          </Card>
+          {activeSection === 'production' && (
+            <Card title="Production by Section">
+              <table style={TBL_STYLE}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${C.borderStrong}`, background: C.bg }}>
+                    {['Section', 'Std', 'Actual', 'MTD', 'Downtime', 'Remarks'].map(h => (
+                      <th key={h} style={TH_STYLE}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    ['cr_chemical_oil', 'CR — Chemical (Oil)'],
+                    ['cr_physical_ghee', 'CR — Physical (Ghee)'],
+                    ['cr_physical_oil', 'CR — Physical (Oil)'],
+                    ['br_hydrogenation', 'BR — Hydrogenation'],
+                    ['br_blending', 'BR — Blending'],
+                    ['br_final_deo_ghee', 'BR — Final DEO (Ghee)'],
+                    ['br_final_deo_oil', 'BR — Final DEO (Oil)'],
+                  ].map(([key, label]) => (
+                    <tr key={key} style={{ borderBottom: `1px solid ${C.border}` }}>
+                      <td style={TD_STYLE}>{label}</td>
+                      <td style={TD_STYLE_MUTED}>{form.production[key].standard}</td>
+                      <td style={{ padding: '6px' }}>
+                        <input type="number" value={num(`production.${key}.actual`)}
+                          onChange={e => update(`production.${key}.actual`, e.target.value)}
+                          style={CELL_INPUT} placeholder="0" step="0.01" />
+                      </td>
+                      <td style={{ padding: '6px' }}>
+                        <input type="number" value={num(`production.${key}.mtd`)}
+                          onChange={e => update(`production.${key}.mtd`, e.target.value)}
+                          style={CELL_INPUT} placeholder="0" step="0.01" />
+                      </td>
+                      <td style={{ padding: '6px' }}>
+                        <input type="number" value={num(`production.${key}.downtime`)}
+                          onChange={e => update(`production.${key}.downtime`, e.target.value)}
+                          style={CELL_INPUT} placeholder="0" step="0.1" />
+                      </td>
+                      <td style={{ padding: '6px' }}>
+                        <input type="text" value={form.production[key].remarks}
+                          onChange={e => update(`production.${key}.remarks`, e.target.value)}
+                          style={{ ...CELL_INPUT, width: 180, textAlign: 'left' }} placeholder="Plant normal" />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Card>
+          )}
+
+          {activeSection === 'filling' && (
+            <>
+              <Card title="Filling — by Plant">
+                <div style={GRID_2}>
+                  <Field label="RYK Cooking Oil (MT)" value={num('filling.ryk_oil')} onChange={v => update('filling.ryk_oil', v)} />
+                  <Field label="RYK Vegetable Ghee (MT)" value={num('filling.ryk_ghee')} onChange={v => update('filling.ryk_ghee', v)} />
+                  <Field label="SKR Cooking Oil (MT)" value={num('filling.skr_oil')} onChange={v => update('filling.skr_oil', v)} />
+                  <Field label="SKR Vegetable Ghee (MT)" value={num('filling.skr_ghee')} onChange={v => update('filling.skr_ghee', v)} />
+                </div>
+              </Card>
+              <Card title="Filling — by Brand">
+                <div style={GRID_2}>
+                  <Field label="Shahbaz Ghee (MT)" value={num('filling.brands.shahbaz_ghee')} onChange={v => update('filling.brands.shahbaz_ghee', v)} />
+                  <Field label="Shahbaz Oil (MT)" value={num('filling.brands.shahbaz_oil')} onChange={v => update('filling.brands.shahbaz_oil', v)} />
+                  <Field label="Gharana Ghee (MT)" value={num('filling.brands.gharana_ghee')} onChange={v => update('filling.brands.gharana_ghee', v)} />
+                  <Field label="Gharana Oil (MT)" value={num('filling.brands.gharana_oil')} onChange={v => update('filling.brands.gharana_oil', v)} />
+                  <Field label="Rite Ghee (MT)" value={num('filling.brands.rite_ghee')} onChange={v => update('filling.brands.rite_ghee', v)} />
+                  <Field label="Rite Oil (MT)" value={num('filling.brands.rite_oil')} onChange={v => update('filling.brands.rite_oil', v)} />
+                </div>
+              </Card>
+            </>
+          )}
+
+          {activeSection === 'soap' && (
+            <Card title="Soap Production">
+              <div style={GRID_2}>
+                <Field label="Total Daily Production (MT)" value={num('soap.total_actual')} onChange={v => update('soap.total_actual', v)} />
+                <Field label="Total MTD Production (MT)" value={num('soap.total_mtd')} onChange={v => update('soap.total_mtd', v)} />
+                <Field label="Forecast MTD (MT)" value={num('soap.forecast')} onChange={v => update('soap.forecast', v)} />
+                <Field label="Plan Compliance (%)" value={num('soap.compliance')} onChange={v => update('soap.compliance', v)} />
+              </div>
+            </Card>
+          )}
+
+          {activeSection === 'mustard' && (
+            <Card title="Mustard Oil Filling">
+              <div style={GRID_2}>
+                <Field label="125 ml Bottle (kg)" value={num('mustard.ml_125')} onChange={v => update('mustard.ml_125', v)} />
+                <Field label="250 ml Bottle (kg)" value={num('mustard.ml_250')} onChange={v => update('mustard.ml_250', v)} />
+                <Field label="500 ml Bottle (kg)" value={num('mustard.ml_500')} onChange={v => update('mustard.ml_500', v)} />
+                <Field label="1000 ml Bottle (kg)" value={num('mustard.ml_1000')} onChange={v => update('mustard.ml_1000', v)} />
+                <Field label="MTD Production (kg)" value={num('mustard.mtd_kg')} onChange={v => update('mustard.mtd_kg', v)} />
+                <Field label="Daily Dispatch (kg)" value={num('mustard.dispatch_kg')} onChange={v => update('mustard.dispatch_kg', v)} />
+              </div>
+            </Card>
+          )}
+
+          {activeSection === 'utilities' && (
+            <>
+              <Card title="Electricity">
+                <div style={GRID_2}>
+                  <Field label="WAPDA Peak (kWh)" value={num('utilities.electricity.wapda_peak')} onChange={v => update('utilities.electricity.wapda_peak', v)} />
+                  <Field label="WAPDA Off-peak (kWh)" value={num('utilities.electricity.wapda_offpeak')} onChange={v => update('utilities.electricity.wapda_offpeak', v)} />
+                  <Field label="Solar (kWh)" value={num('utilities.electricity.solar')} onChange={v => update('utilities.electricity.solar', v)} />
+                  <Field label="Generator (kWh)" value={num('utilities.electricity.generator')} onChange={v => update('utilities.electricity.generator', v)} />
+                </div>
+              </Card>
+              <Card title="Natural Gas — by Section">
+                <div style={GRID_2}>
+                  <Field label="Boiler (ft³)" value={num('utilities.naturalGas.boiler')} onChange={v => update('utilities.naturalGas.boiler', v)} />
+                  <Field label="Continuous Refinery (ft³)" value={num('utilities.naturalGas.cr')} onChange={v => update('utilities.naturalGas.cr', v)} />
+                  <Field label="Hydrogen Plant (ft³)" value={num('utilities.naturalGas.hydrogen')} onChange={v => update('utilities.naturalGas.hydrogen', v)} />
+                  <Field label="Remaining Factory (ft³)" value={num('utilities.naturalGas.remaining')} onChange={v => update('utilities.naturalGas.remaining', v)} />
+                </div>
+              </Card>
+              <Card title="Steam">
+                <div style={GRID_2}>
+                  <Field label="Batch Refinery (MT)" value={num('utilities.steam.br')} onChange={v => update('utilities.steam.br', v)} />
+                  <Field label="Continuous Refinery (MT)" value={num('utilities.steam.cr')} onChange={v => update('utilities.steam.cr', v)} />
+                  <Field label="Soap Plant (MT)" value={num('utilities.steam.soap')} onChange={v => update('utilities.steam.soap', v)} />
+                  <Field label="Gas Plant (MT)" value={num('utilities.steam.gasPlant')} onChange={v => update('utilities.steam.gasPlant', v)} />
+                </div>
+              </Card>
+              <Card title="Other">
+                <div style={GRID_2}>
+                  <Field label="RO Water (MT)" value={num('utilities.water.total')} onChange={v => update('utilities.water.total', v)} />
+                  <Field label="Hydrogen Gas (lb)" value={num('utilities.hydrogen_lb')} onChange={v => update('utilities.hydrogen_lb', v)} />
+                  <Field label="Diesel (L)" value={num('utilities.diesel.total')} onChange={v => update('utilities.diesel.total', v)} />
+                  <Field label="Furnace Oil (L)" value={num('utilities.furnaceOil')} onChange={v => update('utilities.furnaceOil', v)} />
+                </div>
+              </Card>
+            </>
+          )}
+
+          {activeSection === 'stock' && (
+            <>
+              <Card title="Finished Goods & Packable">
+                <div style={GRID_2}>
+                  <Field label="FG Ghee (MT)" value={num('stock.fg_ghee')} onChange={v => update('stock.fg_ghee', v)} />
+                  <Field label="FG Oil (MT)" value={num('stock.fg_oil')} onChange={v => update('stock.fg_oil', v)} />
+                  <Field label="Packable Ghee (MT)" value={num('stock.packable_ghee')} onChange={v => update('stock.packable_ghee', v)} />
+                  <Field label="Packable Oil (MT)" value={num('stock.packable_oil')} onChange={v => update('stock.packable_oil', v)} />
+                  <Field label="Hard Blended Ghee (MT)" value={num('stock.hard_blended_ghee')} onChange={v => update('stock.hard_blended_ghee', v)} />
+                  <Field label="Hard Ghee in OST (MT)" value={num('stock.hard_ghee')} onChange={v => update('stock.hard_ghee', v)} />
+                  <Field label="Mustard Packable (MT)" value={num('stock.mustard_packable')} onChange={v => update('stock.mustard_packable', v)} />
+                  <Field label="Total OST (MT)" value={num('stock.ost_total')} onChange={v => update('stock.ost_total', v)} />
+                </div>
+              </Card>
+              <Card title="OST Tank Breakdown">
+                <div style={GRID_2}>
+                  <Field label="Olein (MT)" value={num('stock.ost_breakdown.olein')} onChange={v => update('stock.ost_breakdown.olein', v)} />
+                  <Field label="RBD (MT)" value={num('stock.ost_breakdown.rbd')} onChange={v => update('stock.ost_breakdown.rbd', v)} />
+                  <Field label="Canola (MT)" value={num('stock.ost_breakdown.canola')} onChange={v => update('stock.ost_breakdown.canola', v)} />
+                  <Field label="Soybean (MT)" value={num('stock.ost_breakdown.soybean')} onChange={v => update('stock.ost_breakdown.soybean', v)} />
+                  <Field label="Cottonseed (MT)" value={num('stock.ost_breakdown.cottonseed')} onChange={v => update('stock.ost_breakdown.cottonseed', v)} />
+                </div>
+              </Card>
+            </>
+          )}
+
+          {activeSection === 'dispatch' && (
+            <Card title="Dispatch Activity">
+              <div style={GRID_2}>
+                <Field label="Total Dispatch (MT)" value={num('dispatch.total_mt')} onChange={v => update('dispatch.total_mt', v)} />
+                <Field label="Vehicles" value={num('dispatch.vehicles')} onChange={v => update('dispatch.vehicles', v)} />
+                <Field label="Ghee Consumer (MT)" value={num('dispatch.ghee_consumer')} onChange={v => update('dispatch.ghee_consumer', v)} />
+                <Field label="Oil Consumer (MT)" value={num('dispatch.oil_consumer')} onChange={v => update('dispatch.oil_consumer', v)} />
+                <Field label="RSO Dispatch (MT)" value={num('dispatch.rso')} onChange={v => update('dispatch.rso', v)} />
+                <Field label="Soap Dispatch (MT)" value={num('dispatch.soap')} onChange={v => update('dispatch.soap', v)} />
+              </div>
+            </Card>
+          )}
         </>
       )}
 
-      {activeSection === 'soap' && (
-        <Card title="Soap Production" subtitle="From Monthly Soap Production Plan Compliance report">
-          <div style={GRID_2}>
-            <Field label="Total Daily Production (MT)" value={num('soap.total_actual')} onChange={v => update('soap.total_actual', v)} />
-            <Field label="Total MTD Production (MT)" value={num('soap.total_mtd')} onChange={v => update('soap.total_mtd', v)} />
-            <Field label="Forecast MTD (MT)" value={num('soap.forecast')} onChange={v => update('soap.forecast', v)} />
-            <Field label="Plan Compliance (%)" value={num('soap.compliance')} onChange={v => update('soap.compliance', v)} />
-          </div>
-        </Card>
-      )}
-
-      {activeSection === 'mustard' && (
-        <Card title="Mustard Oil Filling" subtitle="From Mustard Oil Report / FG Warehouse Report">
-          <div style={GRID_2}>
-            <Field label="125 ml Bottle (kg)" value={num('mustard.ml_125')} onChange={v => update('mustard.ml_125', v)} />
-            <Field label="250 ml Bottle (kg)" value={num('mustard.ml_250')} onChange={v => update('mustard.ml_250', v)} />
-            <Field label="500 ml Bottle (kg)" value={num('mustard.ml_500')} onChange={v => update('mustard.ml_500', v)} />
-            <Field label="1000 ml Bottle (kg)" value={num('mustard.ml_1000')} onChange={v => update('mustard.ml_1000', v)} />
-            <Field label="MTD Production (kg)" value={num('mustard.mtd_kg')} onChange={v => update('mustard.mtd_kg', v)} />
-            <Field label="Daily Dispatch (kg)" value={num('mustard.dispatch_kg')} onChange={v => update('mustard.dispatch_kg', v)} />
-          </div>
-        </Card>
-      )}
-
-      {activeSection === 'utilities' && (
-        <>
-          <Card title="Electricity Consumption">
-            <div style={GRID_2}>
-              <Field label="WAPDA Peak (kWh)" value={num('utilities.electricity.wapda_peak')} onChange={v => update('utilities.electricity.wapda_peak', v)} />
-              <Field label="WAPDA Off-peak (kWh)" value={num('utilities.electricity.wapda_offpeak')} onChange={v => update('utilities.electricity.wapda_offpeak', v)} />
-              <Field label="Solar (kWh)" value={num('utilities.electricity.solar')} onChange={v => update('utilities.electricity.solar', v)} />
-              <Field label="Generator (kWh)" value={num('utilities.electricity.generator')} onChange={v => update('utilities.electricity.generator', v)} />
-            </div>
-          </Card>
-          <Card title="Natural Gas — by Section">
-            <div style={GRID_2}>
-              <Field label="Boiler House (ft³)" value={num('utilities.naturalGas.boiler')} onChange={v => update('utilities.naturalGas.boiler', v)} />
-              <Field label="Continuous Refinery (ft³)" value={num('utilities.naturalGas.cr')} onChange={v => update('utilities.naturalGas.cr', v)} />
-              <Field label="Hydrogen Plant (ft³)" value={num('utilities.naturalGas.hydrogen')} onChange={v => update('utilities.naturalGas.hydrogen', v)} />
-              <Field label="Remaining Factory (ft³)" value={num('utilities.naturalGas.remaining')} onChange={v => update('utilities.naturalGas.remaining', v)} />
-            </div>
-          </Card>
-          <Card title="Steam Production & Distribution">
-            <div style={GRID_2}>
-              <Field label="Batch Refinery (MT)" value={num('utilities.steam.br')} onChange={v => update('utilities.steam.br', v)} />
-              <Field label="Continuous Refinery (MT)" value={num('utilities.steam.cr')} onChange={v => update('utilities.steam.cr', v)} />
-              <Field label="Soap Plant (MT)" value={num('utilities.steam.soap')} onChange={v => update('utilities.steam.soap', v)} />
-              <Field label="Gas Plant (MT)" value={num('utilities.steam.gasPlant')} onChange={v => update('utilities.steam.gasPlant', v)} />
-            </div>
-          </Card>
-          <Card title="Other Utilities">
-            <div style={GRID_2}>
-              <Field label="RO Water Total (MT)" value={num('utilities.water.total')} onChange={v => update('utilities.water.total', v)} />
-              <Field label="Hydrogen Gas (lb)" value={num('utilities.hydrogen_lb')} onChange={v => update('utilities.hydrogen_lb', v)} />
-              <Field label="Total Diesel (L)" value={num('utilities.diesel.total')} onChange={v => update('utilities.diesel.total', v)} />
-              <Field label="Furnace Oil (L)" value={num('utilities.furnaceOil')} onChange={v => update('utilities.furnaceOil', v)} />
-            </div>
-          </Card>
-        </>
-      )}
-
-      {activeSection === 'stock' && (
-        <>
-          <Card title="Finished Goods & Packable">
-            <div style={GRID_2}>
-              <Field label="FG Ghee (MT)" value={num('stock.fg_ghee')} onChange={v => update('stock.fg_ghee', v)} />
-              <Field label="FG Oil (MT)" value={num('stock.fg_oil')} onChange={v => update('stock.fg_oil', v)} />
-              <Field label="Packable Ghee (MT)" value={num('stock.packable_ghee')} onChange={v => update('stock.packable_ghee', v)} />
-              <Field label="Packable Oil (MT)" value={num('stock.packable_oil')} onChange={v => update('stock.packable_oil', v)} />
-              <Field label="Hard Blended Ghee (MT)" value={num('stock.hard_blended_ghee')} onChange={v => update('stock.hard_blended_ghee', v)} />
-              <Field label="Hard Ghee in OST (MT)" value={num('stock.hard_ghee')} onChange={v => update('stock.hard_ghee', v)} />
-              <Field label="Mustard Packable (MT)" value={num('stock.mustard_packable')} onChange={v => update('stock.mustard_packable', v)} />
-              <Field label="Total OST (MT)" value={num('stock.ost_total')} onChange={v => update('stock.ost_total', v)} />
-            </div>
-          </Card>
-          <Card title="OST Tank Breakdown — by Oil Type">
-            <div style={GRID_2}>
-              <Field label="Olein (MT)" value={num('stock.ost_breakdown.olein')} onChange={v => update('stock.ost_breakdown.olein', v)} />
-              <Field label="RBD (MT)" value={num('stock.ost_breakdown.rbd')} onChange={v => update('stock.ost_breakdown.rbd', v)} />
-              <Field label="Canola (MT)" value={num('stock.ost_breakdown.canola')} onChange={v => update('stock.ost_breakdown.canola', v)} />
-              <Field label="Soybean (MT)" value={num('stock.ost_breakdown.soybean')} onChange={v => update('stock.ost_breakdown.soybean', v)} />
-              <Field label="Cottonseed (MT)" value={num('stock.ost_breakdown.cottonseed')} onChange={v => update('stock.ost_breakdown.cottonseed', v)} />
-            </div>
-          </Card>
-        </>
-      )}
-
-      {activeSection === 'dispatch' && (
-        <Card title="Dispatch Activity">
-          <div style={GRID_2}>
-            <Field label="Total Dispatch (MT)" value={num('dispatch.total_mt')} onChange={v => update('dispatch.total_mt', v)} />
-            <Field label="Vehicles Dispatched" value={num('dispatch.vehicles')} onChange={v => update('dispatch.vehicles', v)} />
-            <Field label="Ghee Consumer (MT)" value={num('dispatch.ghee_consumer')} onChange={v => update('dispatch.ghee_consumer', v)} />
-            <Field label="Oil Consumer (MT)" value={num('dispatch.oil_consumer')} onChange={v => update('dispatch.oil_consumer', v)} />
-            <Field label="RSO Dispatch (MT)" value={num('dispatch.rso')} onChange={v => update('dispatch.rso', v)} />
-            <Field label="Soap Dispatch (MT)" value={num('dispatch.soap')} onChange={v => update('dispatch.soap', v)} />
-          </div>
-        </Card>
-      )}
-
+      {/* Backup + Recent (always visible) */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.5fr', gap: 14 }}>
         <Card title="Session Backup">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
@@ -1351,7 +1598,7 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
             <table style={TBL_STYLE}>
               <thead>
                 <tr style={{ borderBottom: `1px solid ${C.border}` }}>
-                  {['Date', 'Plant', 'Oil', 'Ghee', 'Soap'].map(h => <th key={h} style={TH_STYLE}>{h}</th>)}
+                  {['Date', 'Plant', 'Source', 'Oil', 'Ghee', 'Soap'].map(h => <th key={h} style={TH_STYLE}>{h}</th>)}
                 </tr>
               </thead>
               <tbody>
@@ -1359,6 +1606,15 @@ const EntryPage = ({ records, addRecord, exportSession, importSession, clearDemo
                   <tr key={r.id} style={{ borderBottom: `1px solid ${C.border}` }}>
                     <td style={TD_STYLE}>{r.reportDate}</td>
                     <td style={TD_STYLE_MUTED}>{r.plant}</td>
+                    <td style={{ padding: '10px 9px', fontSize: 11 }}>
+                      <span style={{
+                        padding: '2px 7px', borderRadius: 4,
+                        background: r.fileType === 'ai-extracted' ? '#E5F0F1' : C.bg,
+                        color: r.fileType === 'ai-extracted' ? C.primaryDark : C.textMuted,
+                      }}>
+                        {r.fileType === 'ai-extracted' ? 'AI' : 'Manual'}
+                      </span>
+                    </td>
                     <td style={TD_STYLE_NUM}>{fmt(r.data.filling.total_oil)}</td>
                     <td style={TD_STYLE_NUM}>{fmt(r.data.filling.total_ghee)}</td>
                     <td style={TD_STYLE_NUM}>{fmt(r.data.soap.total_actual, 1)}</td>
